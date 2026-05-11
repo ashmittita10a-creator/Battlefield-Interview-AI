@@ -17,7 +17,8 @@ import {
   History,
   MessageSquare,
   Lightbulb,
-  FileDown
+  FileDown,
+  Sparkles
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useInterview } from "@/context/InterviewContext";
@@ -121,6 +122,19 @@ export default function ResultsPage() {
             </div>
           </div>
           <div className="flex gap-3">
+            <div className="hidden md:flex items-center mr-4">
+              {evaluationResult?.aiEnhanced ? (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-[10px] font-black uppercase tracking-widest text-emerald-400">
+                  <Sparkles className="w-3 h-3" />
+                  AI Insights Enabled
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-[10px] font-black uppercase tracking-widest text-blue-400">
+                  <ShieldCheck className="w-3 h-3" />
+                  Standard Report
+                </div>
+              )}
+            </div>
             <button 
               onClick={handleViewHistory}
               className="px-4 py-2 text-sm font-semibold text-gray-400 hover:text-white transition-colors flex items-center gap-2"

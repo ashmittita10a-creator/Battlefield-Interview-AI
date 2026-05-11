@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
+import { analyzeInterviewLocally, EvaluationResponse } from "@/lib/resultAnalyzer";
 
 export const dynamic = "force-dynamic";
 
@@ -15,87 +16,71 @@ export interface EvaluationRequest {
   difficulty: string;
 }
 
-export interface QuestionEvaluation {
-  question: string;
-  userAnswer: string;
-  expectedAnswer: string;
-  score: number;
-  feedback: string;
-}
-
-export interface EvaluationResponse {
-  overallScore: number;
-  technicalAccuracy: number;
-  communication: number;
-  problemSolving: number;
-  confidence: number;
-  strengths: string[];
-  growthAreas: string[];
-  questionBreakdown: QuestionEvaluation[];
-  hireRecommendation: string;
-  finalVerdict: string;
-}
-
-const FALLBACK_RESPONSE: EvaluationResponse = {
-  overallScore: 0,
-  technicalAccuracy: 0,
-  communication: 0,
-  problemSolving: 0,
-  confidence: 0,
-  strengths: [],
-  growthAreas: ["Evaluation parsing failed"],
-  questionBreakdown: [],
-  hireRecommendation: "Inconclusive",
-  finalVerdict: "The evaluation engine encountered an error. Please try again."
-};
-
 /**
  * Ensures all fields in EvaluationResponse are present and valid
  */
-function validateAndSanitize(data: any): EvaluationResponse {
-  const sanitizeNum = (val: any) => typeof val === 'number' ? Math.min(100, Math.max(0, val)) : 0;
+function validateAndSanitize(data: any, fallback: EvaluationResponse): EvaluationResponse {
+  const sanitizeNum = (val: any, def: number) => typeof val === 'number' ? Math.min(100, Math.max(0, val)) : def;
 
   return {
-    overallScore: sanitizeNum(data.overallScore ?? data.overall_score),
-    technicalAccuracy: sanitizeNum(data.technicalAccuracy ?? data.technical_accuracy),
-    communication: sanitizeNum(data.communication),
-    problemSolving: sanitizeNum(data.problemSolving ?? data.problem_solving),
-    confidence: sanitizeNum(data.confidence),
-    strengths: Array.isArray(data.strengths) ? data.strengths : [],
-    growthAreas: Array.isArray(data.growthAreas ?? data.weaknesses) ? (data.growthAreas ?? data.weaknesses) : [],
+    overallScore: sanitizeNum(data.overallScore ?? data.overall_score, fallback.overallScore),
+    technicalAccuracy: sanitizeNum(data.technicalAccuracy ?? data.technical_accuracy, fallback.technicalAccuracy),
+    communication: sanitizeNum(data.communication, fallback.communication),
+    problemSolving: sanitizeNum(data.problemSolving ?? data.problem_solving, fallback.problemSolving),
+    confidence: sanitizeNum(data.confidence, fallback.confidence),
+    strengths: Array.isArray(data.strengths) && data.strengths.length > 0 ? data.strengths : fallback.strengths,
+    growthAreas: Array.isArray(data.growthAreas ?? data.weaknesses) && (data.growthAreas ?? data.weaknesses).length > 0 
+      ? (data.growthAreas ?? data.weaknesses) 
+      : fallback.growthAreas,
     questionBreakdown: Array.isArray(data.questionBreakdown ?? data.improved_answers)
-      ? (data.questionBreakdown ?? data.improved_answers).map((item: any) => ({
-        question: item.question || "N/A",
-        userAnswer: item.userAnswer ?? item.user_answer ?? "N/A",
-        expectedAnswer: item.expectedAnswer ?? item.ideal_answer ?? "N/A",
-        score: sanitizeNum(item.score),
-        feedback: item.feedback || "N/A"
-      }))
-      : [],
-    hireRecommendation: data.hireRecommendation ?? data.hire_recommendation ?? "N/A",
-    finalVerdict: data.finalVerdict ?? data.final_verdict ?? "N/A"
+      ? (data.questionBreakdown ?? data.improved_answers).map((item: any, idx: number) => {
+          const fallbackItem = fallback.questionBreakdown[idx] || fallback.questionBreakdown[0];
+          return {
+            question: item.question || fallbackItem.question,
+            userAnswer: item.userAnswer ?? item.user_answer ?? fallbackItem.userAnswer,
+            expectedAnswer: item.expectedAnswer ?? item.ideal_answer ?? fallbackItem.expectedAnswer,
+            score: sanitizeNum(item.score, fallbackItem.score),
+            feedback: item.feedback || fallbackItem.feedback
+          };
+        })
+      : fallback.questionBreakdown,
+    hireRecommendation: data.hireRecommendation ?? data.hire_recommendation ?? fallback.hireRecommendation,
+    finalVerdict: data.finalVerdict ?? data.final_verdict ?? fallback.finalVerdict
   };
 }
 
 export async function POST(req: NextRequest) {
   console.log("--- Evaluation API Request Started ---");
+  
+  // 1. GENERATE LOCAL BASELINE IMMEDIATELY
+  let localResult: EvaluationResponse | null = null;
+  let body: Partial<EvaluationRequest> = {};
+
   try {
-    if (!process.env.GROQ_API_KEY) {
-      console.error("CRITICAL: GROQ_API_KEY is missing");
-      return NextResponse.json({ success: false, error: "GROQ_API_KEY missing" }, { status: 500 });
-    }
-
-    const body: Partial<EvaluationRequest> = await req.json();
-    console.log("Request Body:", JSON.stringify(body, null, 2));
-
+    body = await req.json();
     const { transcript, role, difficulty } = body;
 
     if (!transcript || !Array.isArray(transcript)) {
-      console.error("Invalid transcript format");
-      return NextResponse.json({ success: false, error: "Invalid transcript format" }, { status: 400 });
+      throw new Error("Invalid transcript format");
     }
 
-    const formattedTranscript = transcript
+    localResult = analyzeInterviewLocally(transcript, role || "Software Engineer", difficulty || "Medium");
+    console.log("Local Baseline Generated Successfully");
+
+  } catch (err: any) {
+    console.error("Error generating local baseline:", err);
+    return NextResponse.json({ success: false, error: err.message }, { status: 400 });
+  }
+
+  // 2. OPTIONAL AI ENHANCEMENT
+  try {
+    if (!process.env.GROQ_API_KEY || process.env.GROQ_API_KEY === "temporary_key_for_build") {
+      console.warn("GROQ_API_KEY is missing or invalid. Skipping AI enhancement.");
+      return NextResponse.json({ success: true, ...localResult, aiEnhanced: false });
+    }
+
+    const { transcript, role, difficulty } = body;
+    const formattedTranscript = transcript!
       .map((t, i) => `Q${i + 1}: ${t.question}\nCandidate Answer: ${t.answer}`)
       .join("\n\n");
 
@@ -104,11 +89,9 @@ Act as a strict Senior Technical Interviewer for a ${role} position (${difficult
 Evaluate the candidate performance with extreme rigor.
 
 ### EVALUATION RULES:
-1. ONLY evaluate the questions actually asked in the transcript. Do NOT invent new questions.
-2. If the candidate's answers are nonsense (e.g., "asdf", "srgws") or empty, the score for that question MUST be near 0.
-3. Random gibberish should result in low overall scores.
-4. "expectedAnswer" must be a top-tier professional response that demonstrates deep technical knowledge.
-5. Provide detailed, educational feedback for each answer.
+1. ONLY evaluate the questions actually asked in the transcript.
+2. If answers are nonsense or empty, the score MUST be near 0.
+3. Provide professional "expectedAnswer" and educational "feedback" for each question.
 
 ### EXPECTED OUTPUT SCHEMA (JSON ONLY):
 {
@@ -128,20 +111,17 @@ Evaluate the candidate performance with extreme rigor.
       "feedback": "string"
     }
   ],
-  "hireRecommendation": "string (Strong Hire, Hire, Leaning Hire, Leaning No Hire, No Hire, Strong No Hire)",
+  "hireRecommendation": "string",
   "finalVerdict": "string"
 }
 `;
 
-    const userPrompt = `
-TRANSCRIPT:
-${formattedTranscript}
+    const userPrompt = `TRANSCRIPT:\n${formattedTranscript}\n\nReturn ONLY JSON.`;
 
-Return ONLY the JSON evaluation according to the schema. No conversational text.
-`;
-
-    console.log("Calling Groq API (llama3-8b-8192)...");
-    const response = await groq.chat.completions.create({
+    console.log("Calling AI for enhancement...");
+    
+    // Set a timeout for the AI call to ensure "instant" fallback if AI is slow
+    const aiPromise = groq.chat.completions.create({
       model: "llama-3.1-8b-instant",
       messages: [
         { role: "system", content: systemPrompt },
@@ -150,58 +130,35 @@ Return ONLY the JSON evaluation according to the schema. No conversational text.
       temperature: 0.1,
     });
 
+    const response = await Promise.race([
+      aiPromise,
+      new Promise<null>((_, reject) => setTimeout(() => reject(new Error("AI Timeout")), 8000))
+    ]);
+
+    if (!response) throw new Error("AI returned null");
+
     const rawContent = response.choices[0]?.message?.content || "";
-    console.log("Raw API Response Content:", rawContent);
+    const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
 
-    // SAFE JSON EXTRACTION LOGIC
-    const cleaned = rawContent
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .replace(/`json/g, "")
-      .replace(/`/g, "")
-      .trim();
+    if (!jsonMatch) throw new Error("No valid JSON found in AI response");
 
-    console.log("Cleaned Response Text:", cleaned);
+    const parsed = JSON.parse(jsonMatch[0]);
+    const validatedData = validateAndSanitize(parsed, localResult!);
 
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    console.log("JSON Match Found:", !!jsonMatch);
-
-    if (!jsonMatch) {
-      console.error("No valid JSON found in AI response");
-      return NextResponse.json({
-        success: true,
-        ...FALLBACK_RESPONSE,
-        growthAreas: ["No valid JSON found in AI response"]
-      });
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonMatch[0]);
-      console.log("Parsed Object:", JSON.stringify(parsed, null, 2));
-    } catch (parseErr) {
-      console.error("JSON Parse Failed:", parseErr);
-      return NextResponse.json({
-        success: true,
-        ...FALLBACK_RESPONSE,
-        growthAreas: ["JSON parsing failed"]
-      });
-    }
-
-    const validatedData = validateAndSanitize(parsed);
-    console.log("Final Returned Object (Validated):", JSON.stringify(validatedData, null, 2));
-
+    console.log("AI Enhancement Successful");
     return NextResponse.json({
       success: true,
-      ...validatedData
+      ...validatedData,
+      aiEnhanced: true
     });
 
   } catch (error: any) {
-    console.error("GROQ BACKEND ERROR:", error);
+    console.error("AI ENHANCEMENT FAILED (using local fallback):", error.message);
     return NextResponse.json({
       success: true,
-      ...FALLBACK_RESPONSE,
-      finalVerdict: "Internal Server Error: " + (error.message || "Unknown error")
+      ...localResult,
+      aiEnhanced: false,
+      fallbackReason: error.message
     });
   } finally {
     console.log("--- Evaluation API Request Completed ---");
